@@ -86,6 +86,10 @@
         server.xml if deemed useful. Storeconfig will not attempt to persist
         the new listener. (remm)
       </update>
+      <fix>
+        <bug>63287</bug>: Make loggin levels more consistent for similar issues
+        of similar severity. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Coyote">
@@ -108,6 +112,11 @@
         When using a JSSE TLS connector that supported ALPN (Java 9 onwards) and
         a protocol was not negotiated, Tomcat failed to fallback to HTTP/1.1 and
         instead dropped the connection. (markt)
+      </fix>
+      <fix>
+        Correct a regression in the TLS connector refactoring in Tomcat 9.0.17
+        that prevented the use of PKCS#8 private keys with OpenSSL based
+        connectors. (markt)
       </fix>
     </changelog>
   </subsection>
