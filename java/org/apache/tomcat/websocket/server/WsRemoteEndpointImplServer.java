@@ -80,12 +80,12 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
                 }
             } else {
                 this.handler = handler;
+                timeout = getSendTimeout();
                 if (timeout > 0) {
                     // Register with timeout thread
                     timeoutExpiry = timeout + System.currentTimeMillis();
                     wsWriteTimeout.register(this);
                 }
-                timeout = getSendTimeout();
             }
             socketWrapper.write(block ? BlockingMode.BLOCK : BlockingMode.SEMI_BLOCK, timeout,
                     TimeUnit.MILLISECONDS, null, SocketWrapperBase.COMPLETE_WRITE_WITH_COMPLETION,
@@ -220,7 +220,7 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
         }
         try {
             socketWrapper.close();
-        } catch (IOException e) {
+        } catch (Exception e) {
             if (log.isInfoEnabled()) {
                 log.info(sm.getString("wsRemoteEndpointServer.closeFailed"), e);
             }

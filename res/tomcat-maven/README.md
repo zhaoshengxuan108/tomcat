@@ -73,7 +73,35 @@ An example `tomcat.yaml` is included which uses the Docker image. It uses the he
 
 ### Cluster
 
-If using the Kubernetes cloud clustering membership provider, the pod needs to have the persmission to view other pods. For exemple with Openshift, this is done with:
+If using the Kubernetes cloud clustering membership provider, the pod needs to have the permission to view other pods. For exemple with Openshift, this is done with:
 ```
 oc policy add-role-to-user view system:serviceaccount:$(oc project -q):default -n $(oc project -q)
+```
+
+## Native Image
+
+Download Graal native-image and tools.
+```
+export JAVA_HOME=/absolute...path...to/graalvm-ce-19.0.0
+export TOMCAT_MAVEN=/absolute...path...to/tomcat-maven
+cd $JAVA_HOME/bin
+./gu install native-image
+```
+As Graal does not support dynamic class loading, all Servlets and support classes of the webapp, which would traditionally be placed
+in `/WEB-INF/classes` and `/WEB-INF/lib`, must be included as part of the tomcat-maven build process, so they are packaged into the
+`target/tomcat-maven-1.0.jar`.
+
+Run Tomcat with the agent in full trace mode.
+```
+cd $TOMCAT_MAVEN
+$JAVA_HOME/bin/java -agentlib:native-image-agent=trace-output=$TOMCAT_MAVEN/target/trace-file.json -jar target/tomcat-maven-1.0.jar
+```
+Then exercise necessary paths of your service with the Tomcat configuration. Any changes to the Tomcat configuration requires running
+the substrate VM with the agent again.
+
+Generate the final json files using native-image-configuration then use native image using the generated reflection metadata:
+```
+$JAVA_HOME/bin/native-image-configure generate --trace-input=$TOMCAT_MAVEN/target/trace-file.json --output-dir=$TOMCAT_MAVEN/target
+$JAVA_HOME/bin/native-image --allow-incomplete-classpath -H:+ReportUnsupportedElementsAtRuntime -H:EnableURLProtocols=jar -H:ConfigurationFileDirectories=$TOMCAT_MAVEN/target/ -H:ReflectionConfigurationFiles=$TOMCAT_MAVEN/tomcat-reflection.json -H:ResourceConfigurationFiles=$TOMCAT_MAVEN/tomcat-resource.json -H:ResourceConfigurationFiles=$TOMCAT_MAVEN/tomcat-resource.json -jar $TOMCAT_MAVEN/target/tomcat-maven-1.0.jar
+./tomcat-maven-1.0 -Dcatalina.base=. -Djava.util.logging.config.file=conf/logging.properties -Djava.util.logging.manager=org.apache.juli.ClassLoaderLogManager
 ```

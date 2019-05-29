@@ -231,7 +231,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
         // Make sure the client has sent a valid connection preface before we
         // send the response to the original request over HTTP/2.
         try {
-            parser.readConnectionPreface();
+            parser.readConnectionPreface(webConnection, stream);
         } catch (Http2Exception e) {
             String msg = sm.getString("upgradeHandler.invalidPreface", connectionId);
             if (log.isDebugEnabled()) {
@@ -243,11 +243,15 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             log.debug(sm.getString("upgradeHandler.prefaceReceived", connectionId));
         }
 
+        processConnection(webConnection, stream);
+    }
+
+    protected void processConnection(WebConnection webConnection, Stream stream) {
         // Send a ping to get an idea of round trip time as early as possible
         try {
             pingManager.sendPing(true);
         } catch (IOException ioe) {
-            throw new ProtocolException(sm.getString("upgradeHandler.pingFailed"), ioe);
+            throw new ProtocolException(sm.getString("upgradeHandler.pingFailed", connectionId), ioe);
         }
 
         if (webConnection != null) {
@@ -255,13 +259,12 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
         }
     }
 
-
     protected Http2Parser getParser(String connectionId) {
         return new Http2Parser(connectionId, this, this);
     }
 
 
-    private void processStreamOnContainerThread(Stream stream) {
+    protected void processStreamOnContainerThread(Stream stream) {
         StreamProcessor streamProcessor = new StreamProcessor(this, stream, adapter, socketWrapper);
         streamProcessor.setSslSupport(sslSupport);
         processStreamOnContainerThread(streamProcessor, SocketEvent.OPEN_READ);
@@ -745,10 +748,11 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
 
     int reserveWindowSize(Stream stream, int reservation, boolean block) throws IOException {
-        // Need to be holding the stream lock so releaseBacklog() can't notify
-        // this thread until after this thread enters wait()
+        // Need to be holding the connection allocation lock so releaseBacklog()
+        // can't notify this thread until after this thread enters wait()
         int allocation = 0;
-        synchronized (stream) {
+        Object connectionAllocationLock = stream.getConnectionAllocationLock();
+        synchronized (connectionAllocationLock) {
             do {
                 synchronized (this) {
                     if (!stream.canWrite()) {
@@ -798,7 +802,36 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                 if (allocation == 0) {
                     if (block) {
                         try {
-                            stream.wait();
+                            // Connection level window is empty. Although this
+                            // request is for a stream, use the connection
+                            // timeout
+                            long writeTimeout = protocol.getWriteTimeout();
+                            if (writeTimeout < 0) {
+                                connectionAllocationLock.wait();
+                            } else {
+                                connectionAllocationLock.wait(writeTimeout);
+                                // Has this stream been granted an allocation
+                                // Note: If the stream in not in this Map then the
+                                //       requested write has been fully allocated
+                                int[] value;
+                                // Ensure allocations made in other threads are visible
+                                synchronized (this) {
+                                    value = backLogStreams.get(stream);
+                                }
+                                if (value != null && value[1] == 0) {
+                                    if (log.isDebugEnabled()) {
+                                        log.debug(sm.getString("upgradeHandler.noAllocation",
+                                                connectionId, stream.getIdentifier()));
+                                    }
+                                    // No allocation
+                                    // Close the connection. Do this first since
+                                    // closing the stream will raise an exception
+                                    close();
+                                    // Close the stream (in app code so need to
+                                    // signal to app stream is closing)
+                                    stream.doWriteTimeout();
+                                }
+                            }
                         } catch (InterruptedException e) {
                             throw new IOException(sm.getString(
                                     "upgradeHandler.windowSizeReservationInterrupted", connectionId,
@@ -815,7 +848,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
 
 
-    @SuppressWarnings("sync-override") // notifyAll() needs to be outside sync
+    @SuppressWarnings("sync-override") // notify() needs to be outside sync
                                        // to avoid deadlock
     @Override
     protected void incrementWindowSize(int increment) throws Http2Exception {
@@ -844,12 +877,13 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                 Response coyoteResponse = ((Stream) stream).getCoyoteResponse();
                 if (coyoteResponse.getWriteListener() == null) {
                     if (log.isDebugEnabled()) {
-                        log.debug(sm.getString("upgradeHandler.notifyAll",
+                        log.debug(sm.getString("upgradeHandler.notify",
                             connectionId, stream.getIdentifier()));
                     }
                     // Blocking, so use notify to release StreamOutputBuffer
-                    synchronized (stream) {
-                        stream.notifyAll();
+                    Object connectionAllocationLock = ((Stream) stream).getConnectionAllocationLock();
+                    synchronized (connectionAllocationLock) {
+                        connectionAllocationLock.notify();
                     }
                 } else {
                     if (log.isDebugEnabled()) {
@@ -1021,16 +1055,21 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
 
     private void close() {
-        connectionState.set(ConnectionState.CLOSED);
+        ConnectionState previous = connectionState.getAndSet(ConnectionState.CLOSED);
+        if (previous == ConnectionState.CLOSED) {
+            // Already closed
+            return;
+        }
+
         for (Stream stream : streams.values()) {
             // The connection is closing. Close the associated streams as no
-            // longer required.
+            // longer required (also notifies any threads waiting for allocations).
             stream.receiveReset(Http2Error.CANCEL.getCode());
         }
         try {
             socketWrapper.close();
-        } catch (IOException ioe) {
-            log.debug(sm.getString("upgradeHandler.socketCloseFailed"), ioe);
+        } catch (Exception e) {
+            log.debug(sm.getString("upgradeHandler.socketCloseFailed"), e);
         }
     }
 

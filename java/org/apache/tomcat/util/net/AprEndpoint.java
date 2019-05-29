@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.channels.CompletionHandler;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -28,6 +29,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
@@ -115,6 +118,11 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         // Need to override the default for maxConnections to align it with what
         // was pollerSize (before the two were merged)
         setMaxConnections(8 * 1024);
+        // Asynchronous IO has significantly lower performance with APR:
+        // - no IO vectoring
+        // - mandatory use of direct buffers forces output buffering
+        // - needs extra output flushes due to buffering
+        setUseAsyncIO(false);
     }
 
     // ------------------------------------------------------------- Properties
@@ -346,12 +354,6 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             setUseSendfileInternal(false);
         }
 
-        // Initialize thread count default for acceptor
-        if (acceptorThreadCount == 0) {
-            // FIXME: Doesn't seem to work that well with multiple accept threads
-            acceptorThreadCount = 1;
-        }
-
         // Delay accepting of new connections until data is available
         // Only Linux kernels 2.4 + have that implemented
         // on other platforms this call is noop and will return APR_ENOTIMPL.
@@ -451,8 +453,10 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             running = true;
             paused = false;
 
-            processorCache = new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
-                    socketProperties.getProcessorCache());
+            if (socketProperties.getProcessorCache() != 0) {
+                processorCache = new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
+                        socketProperties.getProcessorCache());
+            }
 
             // Create worker collection
             if (getExecutor() == null) {
@@ -473,7 +477,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 sendfile.start();
             }
 
-            startAcceptorThreads();
+            startAcceptorThread();
         }
     }
 
@@ -490,33 +494,27 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             running = false;
             poller.stop();
             for (SocketWrapperBase<Long> socketWrapper : connections.values()) {
+                socketWrapper.close();
+            }
+            long waitLeft = 10000;
+            while (waitLeft > 0 &&
+                    acceptor.getState() != AcceptorState.ENDED &&
+                    serverSock != 0) {
                 try {
-                    socketWrapper.close();
-                } catch (IOException e) {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
                     // Ignore
                 }
+                waitLeft -= 50;
             }
-            for (Acceptor<Long> acceptor : acceptors) {
-                long waitLeft = 10000;
-                while (waitLeft > 0 &&
-                        acceptor.getState() != AcceptorState.ENDED &&
-                        serverSock != 0) {
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        // Ignore
-                    }
-                    waitLeft -= 50;
-                }
-                if (waitLeft == 0) {
-                    log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed",
-                            acceptor.getThreadName()));
-                   // If the Acceptor is still running force
-                   // the hard socket close.
-                   if (serverSock != 0) {
-                       Socket.shutdown(serverSock, Socket.APR_SHUTDOWN_READ);
-                       serverSock = 0;
-                   }
+            if (waitLeft == 0) {
+                log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed",
+                        acceptor.getThreadName()));
+                // If the Acceptor is still running force
+                // the hard socket close.
+                if (serverSock != 0) {
+                    Socket.shutdown(serverSock, Socket.APR_SHUTDOWN_READ);
+                    serverSock = 0;
                 }
             }
             try {
@@ -535,7 +533,10 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 }
                 sendfile = null;
             }
-            processorCache.clear();
+            if (processorCache != null) {
+                processorCache.clear();
+                processorCache = null;
+            }
         }
         shutdownExecutor();
     }
@@ -673,30 +674,26 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
     @Override
     protected boolean setSocketOptions(Long socket) {
         try {
-            // During shutdown, executor may be null - avoid NPE
-            if (running) {
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("endpoint.debug.socket", socket));
-                }
-                AprSocketWrapper wrapper = new AprSocketWrapper(socket, this);
-                wrapper.setKeepAliveLeft(getMaxKeepAliveRequests());
-                wrapper.setSecure(isSSLEnabled());
-                wrapper.setReadTimeout(getConnectionTimeout());
-                wrapper.setWriteTimeout(getConnectionTimeout());
-                connections.put(socket, wrapper);
-                getExecutor().execute(new SocketWithOptionsProcessor(wrapper));
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("endpoint.debug.socket", socket));
             }
+            AprSocketWrapper wrapper = new AprSocketWrapper(socket, this);
+            wrapper.setKeepAliveLeft(getMaxKeepAliveRequests());
+            wrapper.setSecure(isSSLEnabled());
+            wrapper.setReadTimeout(getConnectionTimeout());
+            wrapper.setWriteTimeout(getConnectionTimeout());
+            connections.put(socket, wrapper);
+            getExecutor().execute(new SocketWithOptionsProcessor(wrapper));
+            return true;
         } catch (RejectedExecutionException x) {
             log.warn(sm.getString("endpoint.rejectedExecution", socket), x);
-            return false;
         } catch (Throwable t) {
             ExceptionUtils.handleThrowable(t);
             // This means we got an OOM or similar creating a thread, or that
             // the pool and its queue are full
             log.error(sm.getString("endpoint.process.fail"), t);
-            return false;
         }
-        return true;
+        return false;
     }
 
 
@@ -725,8 +722,14 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
      *         socket should be closed
      */
     protected boolean processSocket(long socket, SocketEvent event) {
-        SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
-        return processSocket(socketWrapper, event, true);
+        AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
+        if (event == SocketEvent.OPEN_READ && socketWrapper.readOperation != null) {
+            return socketWrapper.readOperation.process();
+        } else if (event == SocketEvent.OPEN_WRITE && socketWrapper.writeOperation != null) {
+            return socketWrapper.writeOperation.process();
+        } else {
+            return processSocket(socketWrapper, event, true);
+        }
     }
 
 
@@ -1315,9 +1318,19 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                     log.debug(sm.getString("endpoint.debug.socketTimeout",
                             Long.valueOf(socket)));
                 }
-                SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
-                socketWrapper.setError(new SocketTimeoutException());
-                processSocket(socketWrapper, SocketEvent.ERROR, true);
+                AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
+                if (socketWrapper != null) {
+                    socketWrapper.setError(new SocketTimeoutException());
+                    if (socketWrapper.readOperation != null || socketWrapper.writeOperation != null) {
+                        if (socketWrapper.readOperation != null) {
+                            socketWrapper.readOperation.process();
+                        } else {
+                            socketWrapper.writeOperation.process();
+                        }
+                    } else {
+                        processSocket(socketWrapper, SocketEvent.ERROR, true);
+                    }
+                }
                 socket = timeouts.check(date);
             }
 
@@ -1514,7 +1527,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                                     // codes plus the flags it was waiting for or it may just
                                     // return an error code. We could handle the error here but
                                     // if we do, there will be no exception associated with the
-                                    // error in application code. By signalling read/write is
+                                    // error in application code. By signaling read/write is
                                     // possible, a read/write will be attempted, fail and that
                                     // will trigger an exception the application will see.
                                     // Check the return flags first, followed by what the socket
@@ -1885,7 +1898,9 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                     maintainTime = 0;
                     try {
                         synchronized (this) {
-                            this.wait();
+                            if (sendfileRunning && sendfileCount < 1 && addS.size() < 1) {
+                                this.wait();
+                            }
                         }
                     } catch (InterruptedException e) {
                         // Ignore
@@ -2115,7 +2130,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 socketWrapper = null;
                 event = null;
                 //return to cache
-                if (running && !paused) {
+                if (running && !paused && processorCache != null) {
                     processorCache.push(this);
                 }
             }
@@ -2129,12 +2144,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         private final ByteBuffer sslOutputBuffer;
 
-        private final Object closedLock = new Object();
-        private volatile boolean closed = false;
-
         // This field should only be used by Poller#run()
         private int pollerFlags = 0;
-
 
         public AprSocketWrapper(Long socket, AprEndpoint endpoint) {
             super(socket, endpoint);
@@ -2226,7 +2237,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
 
         private int fillReadBuffer(boolean block, ByteBuffer to) throws IOException {
-            if (closed) {
+            if (isClosed()) {
                 throw new IOException(sm.getString("socket.apr.closed", getSocket()));
             }
 
@@ -2323,27 +2334,25 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
 
         @Override
-        public void close() {
-            getEndpoint().getHandler().release(this);
-            synchronized (closedLock) {
-                // APR typically crashes if the same socket is closed twice so
-                // make sure that doesn't happen.
-                if (closed) {
-                    return;
+        protected void doClose() {
+            if (log.isDebugEnabled()) {
+                log.debug("Calling [" + getEndpoint() + "].closeSocket([" + this + "])", new Exception());
+            }
+            try {
+                getEndpoint().getHandler().release(this);
+            } catch (Throwable e) {
+                ExceptionUtils.handleThrowable(e);
+                if (log.isDebugEnabled()) {
+                    log.error(sm.getString("endpoint.debug.handlerRelease"), e);
                 }
-                closed = true;
+            }
+            socketBufferHandler = SocketBufferHandler.EMPTY;
+            nonBlockingWriteBuffer.clear();
+            synchronized (closed) {
                 if (sslOutputBuffer != null) {
                     ByteBufferUtils.cleanDirectBuffer(sslOutputBuffer);
                 }
                 ((AprEndpoint) getEndpoint()).getPoller().close(getSocket().longValue());
-            }
-        }
-
-
-        @Override
-        public boolean isClosed() {
-            synchronized (closedLock) {
-                return closed;
             }
         }
 
@@ -2401,7 +2410,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void doWrite(boolean block, ByteBuffer from) throws IOException {
-            if (closed) {
+            if (isClosed()) {
                 throw new IOException(sm.getString("socket.apr.closed", getSocket()));
             }
 
@@ -2501,8 +2510,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         @Override
         public void registerReadInterest() {
             // Make sure an already closed socket is not added to the poller
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return;
                 }
                 Poller p = ((AprEndpoint) getEndpoint()).getPoller();
@@ -2516,8 +2525,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         @Override
         public void registerWriteInterest() {
             // Make sure an already closed socket is not added to the poller
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return;
                 }
                 ((AprEndpoint) getEndpoint()).getPoller().add(
@@ -2541,7 +2550,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemoteAddr() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2556,7 +2565,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemoteHost() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2574,7 +2583,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemotePort() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2590,7 +2599,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalName() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2605,7 +2614,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalAddr() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2620,7 +2629,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalPort() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2704,8 +2713,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         String getSSLInfoS(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return null;
                 }
                 try {
@@ -2717,8 +2726,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         int getSSLInfoI(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return 0;
                 }
                 try {
@@ -2730,8 +2739,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         byte[] getSSLInfoB(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return null;
                 }
                 try {
@@ -2741,5 +2750,118 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 }
             }
         }
+
+        @Override
+        protected <A> OperationState<A> newOperationState(boolean read,
+                ByteBuffer[] buffers, int offset, int length,
+                BlockingMode block, long timeout, TimeUnit unit, A attachment,
+                CompletionCheck check, CompletionHandler<Long, ? super A> handler,
+                Semaphore semaphore, VectoredIOCompletionHandler<A> completion) {
+            return new AprOperationState<>(read, buffers, offset, length, block,
+                    timeout, unit, attachment, check, handler, semaphore, completion);
+        }
+
+        private class AprOperationState<A> extends OperationState<A> {
+            private volatile boolean inline = true;
+            private volatile long flushBytes = 0;
+            private AprOperationState(boolean read, ByteBuffer[] buffers, int offset, int length,
+                    BlockingMode block, long timeout, TimeUnit unit, A attachment, CompletionCheck check,
+                    CompletionHandler<Long, ? super A> handler, Semaphore semaphore,
+                    VectoredIOCompletionHandler<A> completion) {
+                super(read, buffers, offset, length, block,
+                        timeout, unit, attachment, check, handler, semaphore, completion);
+            }
+
+            @Override
+            protected boolean isInline() {
+                return inline;
+            }
+
+            @Override
+            public void run() {
+                // Perform the IO operation
+                // Called from the poller to continue the IO operation
+                long nBytes = 0;
+                if (getError() == null) {
+                    try {
+                        synchronized (this) {
+                            if (!completionDone) {
+                                // This filters out same notification until processing
+                                // of the current one is done
+                                if (log.isDebugEnabled()) {
+                                    log.debug("Skip concurrent " + (read ? "read" : "write") + " notification");
+                                }
+                                return;
+                            }
+                            // Find the buffer on which the operation will be performed (no vectoring with APR)
+                            ByteBuffer buffer = null;
+                            for (int i = 0; i < length; i++) {
+                                if (buffers[i + offset].hasRemaining()) {
+                                    buffer = buffers[i + offset];
+                                    break;
+                                }
+                            }
+                            if (buffer == null && flushBytes == 0) {
+                                // Nothing to do
+                                return;
+                            }
+                            if (read) {
+                                nBytes = read(false, buffer);
+                            } else {
+                                if (!flush(block == BlockingMode.BLOCK)) {
+                                    if (flushBytes > 0) {
+                                        // Flushing was done, continue processing
+                                        nBytes = flushBytes;
+                                        flushBytes = 0;
+                                    } else {
+                                        @SuppressWarnings("null") // Not possible
+                                        int remaining = buffer.remaining();
+                                        write(block == BlockingMode.BLOCK, buffer);
+                                        nBytes = remaining - buffer.remaining();
+                                        if (nBytes > 0 && flush(block == BlockingMode.BLOCK)) {
+                                            // We have to flush and it's incomplete, save the bytes written until done
+                                            inline = false;
+                                            registerWriteInterest();
+                                            flushBytes = nBytes;
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    // Continue flushing
+                                    inline = false;
+                                    registerWriteInterest();
+                                    return;
+                                }
+                            }
+                            if (nBytes != 0) {
+                                completionDone = false;
+                            }
+                        }
+                    } catch (IOException e) {
+                        setError(e);
+                    }
+                }
+                if (nBytes > 0) {
+                    // The bytes processed are only updated in the completion handler
+                    completion.completed(Long.valueOf(nBytes), this);
+                } else if (nBytes < 0 || getError() != null) {
+                    IOException error = getError();
+                    if (error == null) {
+                        error = new EOFException();
+                    }
+                    completion.failed(error, this);
+                } else {
+                    // As soon as the operation uses the poller, it is no longer inline
+                    inline = false;
+                    if (read) {
+                        registerReadInterest();
+                    } else {
+                        registerWriteInterest();
+                    }
+                }
+            }
+
+        }
+
     }
 }

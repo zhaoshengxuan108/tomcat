@@ -137,7 +137,9 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     private static final String CLASS_FILE_SUFFIX = ".class";
 
     static {
-        ClassLoader.registerAsParallelCapable();
+        if (!JreCompat.isGraalAvailable()) {
+            ClassLoader.registerAsParallelCapable();
+        }
         JVM_THREAD_GROUP_NAMES.add(JVM_THREAD_GROUP_SYSTEM);
         JVM_THREAD_GROUP_NAMES.add("RMI Runtime");
     }
@@ -1215,7 +1217,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     @Override
     public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
 
-        synchronized (getClassLoadingLock(name)) {
+        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
             if (log.isDebugEnabled())
                 log.debug("loadClass(" + name + ", " + resolve + ")");
             Class<?> clazz = null;
@@ -1234,7 +1236,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
             }
 
             // (0.1) Check our previously loaded class cache
-            clazz = findLoadedClass(name);
+            clazz = JreCompat.isGraalAvailable() ? null : findLoadedClass(name);
             if (clazz != null) {
                 if (log.isDebugEnabled())
                     log.debug("  Returning class from cache");
@@ -1612,19 +1614,21 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
             }
         }
 
-        // De-register any remaining JDBC drivers
-        clearReferencesJdbc();
+        if (!JreCompat.isGraalAvailable()) {
+            // De-register any remaining JDBC drivers
+            clearReferencesJdbc();
+        }
 
         // Stop any threads the web application started
         clearReferencesThreads();
 
         // Clear any references retained in the serialization caches
-        if (clearReferencesObjectStreamClassCaches) {
+        if (clearReferencesObjectStreamClassCaches && !JreCompat.isGraalAvailable()) {
             clearReferencesObjectStreamClassCaches();
         }
 
         // Check for leaks triggered by ThreadLocals loaded by this class loader
-        if (clearReferencesThreadLocals) {
+        if (clearReferencesThreadLocals && !JreCompat.isGraalAvailable()) {
             checkThreadLocalsForLeaks();
         }
 
@@ -2323,7 +2327,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
         if (clazz != null)
             return clazz;
 
-        synchronized (getClassLoadingLock(name)) {
+        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
             clazz = entry.loadedClass;
             if (clazz != null)
                 return clazz;
