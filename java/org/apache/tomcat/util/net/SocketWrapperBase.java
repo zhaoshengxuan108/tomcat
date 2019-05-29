@@ -16,18 +16,26 @@
  */
 package org.apache.tomcat.util.net;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.CompletionHandler;
+import java.nio.channels.InterruptedByTimeoutException;
+import java.nio.channels.ReadPendingException;
+import java.nio.channels.WritePendingException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 public abstract class SocketWrapperBase<E> {
@@ -36,8 +44,10 @@ public abstract class SocketWrapperBase<E> {
 
     protected static final StringManager sm = StringManager.getManager(SocketWrapperBase.class);
 
-    private final E socket;
+    private E socket;
     private final AbstractEndpoint<E,?> endpoint;
+
+    protected final AtomicBoolean closed = new AtomicBoolean(false);
 
     // Volatile because I/O and setting the timeout values occurs on a different
     // thread to the thread checking the timeout.
@@ -93,16 +103,32 @@ public abstract class SocketWrapperBase<E> {
      */
     protected final WriteBuffer nonBlockingWriteBuffer = new WriteBuffer(bufferedWriteSize);
 
+    protected final Semaphore readPending;
+    protected OperationState<?> readOperation = null;
+    protected final Semaphore writePending;
+    protected OperationState<?> writeOperation = null;
+
     public SocketWrapperBase(E socket, AbstractEndpoint<E,?> endpoint) {
         this.socket = socket;
         this.endpoint = endpoint;
         ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
         this.blockingStatusReadLock = lock.readLock();
         this.blockingStatusWriteLock = lock.writeLock();
+        if (endpoint.getUseAsyncIO() || needSemaphores()) {
+            readPending = new Semaphore(1);
+            writePending = new Semaphore(1);
+        } else {
+            readPending = null;
+            writePending = null;
+        }
     }
 
     public E getSocket() {
         return socket;
+    }
+
+    protected void reset(E closedSocket) {
+        socket = closedSocket;
     }
 
     protected AbstractEndpoint<E,?> getEndpoint() {
@@ -360,8 +386,27 @@ public abstract class SocketWrapperBase<E> {
     }
 
 
-    public abstract void close() throws IOException;
-    public abstract boolean isClosed();
+    /**
+     * Close the socket wrapper.
+     */
+    public void close() {
+        if (closed.compareAndSet(false, true)) {
+            doClose();
+        }
+    }
+
+    /**
+     * Perform the actual close. The closed atomic boolean guarantees this will
+     * be called only once per wrapper.
+     */
+    protected abstract void doClose();
+
+    /**
+     * @return true if the wrapper has been closed
+     */
+    public boolean isClosed() {
+        return closed.get();
+    }
 
 
     /**
@@ -808,7 +853,12 @@ public abstract class SocketWrapperBase<E> {
 
     public enum BlockingMode {
         /**
-         * The operation will now block. If there are pending operations,
+         * The operation will not block. If there are pending operations,
+         * the operation will throw a pending exception.
+         */
+        CLASSIC,
+        /**
+         * The operation will not block. If there are pending operations,
          * the operation will return CompletionState.NOT_DONE.
          */
         NON_BLOCK,
@@ -892,7 +942,7 @@ public abstract class SocketWrapperBase<E> {
         public CompletionHandlerCall callHandler(CompletionState state, ByteBuffer[] buffers,
                 int offset, int length) {
             for (int i = 0; i < length; i++) {
-                if (buffers[offset + i].remaining() > 0) {
+                if (buffers[offset + i].hasRemaining()) {
                     return CompletionHandlerCall.CONTINUE;
                 }
             }
@@ -910,7 +960,7 @@ public abstract class SocketWrapperBase<E> {
         public CompletionHandlerCall callHandler(CompletionState state, ByteBuffer[] buffers,
                 int offset, int length) {
             for (int i = 0; i < length; i++) {
-                if (buffers[offset + i].remaining() > 0) {
+                if (buffers[offset + i].hasRemaining()) {
                     return CompletionHandlerCall.CONTINUE;
                 }
             }
@@ -933,12 +983,212 @@ public abstract class SocketWrapperBase<E> {
     };
 
     /**
-     * Allows using NIO2 style read/write only for connectors that can
-     * efficiently support it.
+     * This utility CompletionCheck will cause the completion handler
+     * to be called once the given buffers are full. The completion
+     * handler will then be called.
+     */
+    public static final CompletionCheck COMPLETE_READ_WITH_COMPLETION = COMPLETE_WRITE_WITH_COMPLETION;
+
+    /**
+     * This utility CompletionCheck will cause the completion handler
+     * to be called once the given buffers are full. If the operation
+     * completes inline, the completion handler will not be called.
+     */
+    public static final CompletionCheck COMPLETE_READ = COMPLETE_WRITE;
+
+    /**
+     * Internal state tracker for vectored operations.
+     */
+    protected abstract class OperationState<A> implements Runnable {
+        protected final boolean read;
+        protected final ByteBuffer[] buffers;
+        protected final int offset;
+        protected final int length;
+        protected final A attachment;
+        protected final long timeout;
+        protected final TimeUnit unit;
+        protected final BlockingMode block;
+        protected final CompletionCheck check;
+        protected final CompletionHandler<Long, ? super A> handler;
+        protected final Semaphore semaphore;
+        protected final VectoredIOCompletionHandler<A> completion;
+        protected OperationState(boolean read, ByteBuffer[] buffers, int offset, int length,
+                BlockingMode block, long timeout, TimeUnit unit, A attachment,
+                CompletionCheck check, CompletionHandler<Long, ? super A> handler,
+                Semaphore semaphore, VectoredIOCompletionHandler<A> completion) {
+            this.read = read;
+            this.buffers = buffers;
+            this.offset = offset;
+            this.length = length;
+            this.block = block;
+            this.timeout = timeout;
+            this.unit = unit;
+            this.attachment = attachment;
+            this.check = check;
+            this.handler = handler;
+            this.semaphore = semaphore;
+            this.completion = completion;
+        }
+        protected volatile long nBytes = 0;
+        protected volatile CompletionState state = CompletionState.PENDING;
+        protected boolean completionDone = true;
+
+        /**
+         * @return true if the operation is still inline, false if the operation
+         *   is running on a thread that is not the original caller
+         */
+        protected abstract boolean isInline();
+
+        /**
+         * Process the operation using the connector executor.
+         * @return true if the operation was accepted, false if the executor
+         *     rejected execution
+         */
+        protected boolean process() {
+            try {
+                getEndpoint().getExecutor().execute(this);
+                return true;
+            } catch (RejectedExecutionException ree) {
+                log.warn(sm.getString("endpoint.executor.fail", SocketWrapperBase.this) , ree);
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                // This means we got an OOM or similar creating a thread, or that
+                // the pool and its queue are full
+                log.error(sm.getString("endpoint.process.fail"), t);
+            }
+            return false;
+        }
+
+        /**
+         * Start the operation, this will typically call run.
+         */
+        protected void start() {
+            run();
+        }
+
+        /**
+         * End the operation.
+         */
+        protected void end() {
+        }
+
+    }
+
+    /**
+     * Completion handler for vectored operations. This will check the completion of the operation,
+     * then either continue or call the user provided completion handler.
+     */
+    protected class VectoredIOCompletionHandler<A> implements CompletionHandler<Long, OperationState<A>> {
+        @Override
+        public void completed(Long nBytes, OperationState<A> state) {
+            if (nBytes.longValue() < 0) {
+                failed(new EOFException(), state);
+            } else {
+                state.nBytes += nBytes.longValue();
+                CompletionState currentState = state.isInline() ? CompletionState.INLINE : CompletionState.DONE;
+                boolean complete = true;
+                boolean completion = true;
+                if (state.check != null) {
+                    CompletionHandlerCall call = state.check.callHandler(currentState, state.buffers, state.offset, state.length);
+                    if (call == CompletionHandlerCall.CONTINUE) {
+                        complete = false;
+                    } else if (call == CompletionHandlerCall.NONE) {
+                        completion = false;
+                    }
+                }
+                if (complete) {
+                    boolean notify = false;
+                    state.semaphore.release();
+                    if (state.read) {
+                        readOperation = null;
+                    } else {
+                        writeOperation = null;
+                    }
+                    if (state.block == BlockingMode.BLOCK && currentState != CompletionState.INLINE) {
+                        notify = true;
+                    } else {
+                        state.state = currentState;
+                    }
+                    state.end();
+                    if (completion && state.handler != null) {
+                        state.handler.completed(Long.valueOf(state.nBytes), state.attachment);
+                    }
+                    synchronized (state) {
+                        state.completionDone = true;
+                        if (notify) {
+                            state.state = currentState;
+                            state.notify();
+                        }
+                    }
+                } else {
+                    synchronized (state) {
+                        state.completionDone = true;
+                    }
+                    state.run();
+                }
+            }
+        }
+        @Override
+        public void failed(Throwable exc, OperationState<A> state) {
+            IOException ioe = null;
+            if (exc instanceof InterruptedByTimeoutException) {
+                ioe = new SocketTimeoutException();
+                exc = ioe;
+            } else if (exc instanceof IOException) {
+                ioe = (IOException) exc;
+            }
+            setError(ioe);
+            boolean notify = false;
+            state.semaphore.release();
+            if (state.read) {
+                readOperation = null;
+            } else {
+                writeOperation = null;
+            }
+            if (state.block == BlockingMode.BLOCK) {
+                notify = true;
+            } else {
+                state.state = state.isInline() ? CompletionState.ERROR : CompletionState.DONE;
+            }
+            state.end();
+            if (state.handler != null) {
+                state.handler.failed(exc, state.attachment);
+            }
+            synchronized (state) {
+                state.completionDone = true;
+                if (notify) {
+                    state.state = state.isInline() ? CompletionState.ERROR : CompletionState.DONE;
+                    state.notify();
+                }
+            }
+        }
+    }
+
+    /**
+     * Allows using NIO2 style read/write.
+     *
+     * @return {@code true} if the connector has the capability enabled
+     */
+    public boolean hasAsyncIO() {
+        // The semaphores are only created if async IO is enabled
+        return (readPending != null);
+    }
+
+    /**
+     * Allows indicating if the connector needs semaphores.
      *
      * @return This default implementation always returns {@code false}
      */
-    public boolean hasAsyncIO() {
+    public boolean needSemaphores() {
+        return false;
+    }
+
+    /**
+     * Allows indicating if the connector supports per operation timeout.
+     *
+     * @return This default implementation always returns {@code false}
+     */
+    public boolean hasPerOperationTimeout() {
         return false;
     }
 
@@ -992,6 +1242,29 @@ public abstract class SocketWrapperBase<E> {
 
     /**
      * Scatter read. The completion handler will be called once some
+     * data has been read or an error occurred. The default NIO2
+     * behavior is used: the completion handler will be called as soon
+     * as some data has been read, even if the read has completed inline.
+     *
+     * @param timeout timeout duration for the read
+     * @param unit units for the timeout duration
+     * @param attachment an object to attach to the I/O operation that will be
+     *        used when calling the completion handler
+     * @param handler to call when the IO is complete
+     * @param dsts buffers
+     * @param <A> The attachment type
+     * @return the completion state (done, done inline, or still pending)
+     */
+    public final <A> CompletionState read(long timeout, TimeUnit unit, A attachment,
+            CompletionHandler<Long, ? super A> handler, ByteBuffer... dsts) {
+        if (dsts == null) {
+            throw new IllegalArgumentException();
+        }
+        return read(dsts, 0, dsts.length, BlockingMode.CLASSIC, timeout, unit, attachment, null, handler);
+    }
+
+    /**
+     * Scatter read. The completion handler will be called once some
      * data has been read or an error occurred. If a CompletionCheck
      * object has been provided, the completion handler will only be
      * called if the callHandler method returned true. If no
@@ -1041,10 +1314,34 @@ public abstract class SocketWrapperBase<E> {
      * @param <A> The attachment type
      * @return the completion state (done, done inline, or still pending)
      */
-    public <A> CompletionState read(ByteBuffer[] dsts, int offset, int length,
+    public final <A> CompletionState read(ByteBuffer[] dsts, int offset, int length,
             BlockingMode block, long timeout, TimeUnit unit, A attachment,
             CompletionCheck check, CompletionHandler<Long, ? super A> handler) {
-        throw new UnsupportedOperationException();
+        return vectoredOperation(true, dsts, offset, length, block, timeout, unit, attachment, check, handler);
+    }
+
+    /**
+     * Gather write. The completion handler will be called once some
+     * data has been written or an error occurred. The default NIO2
+     * behavior is used: the completion handler will be called, even
+     * if the write is incomplete and data remains in the buffers, or
+     * if the write completed inline.
+     *
+     * @param timeout timeout duration for the write
+     * @param unit units for the timeout duration
+     * @param attachment an object to attach to the I/O operation that will be
+     *        used when calling the completion handler
+     * @param handler to call when the IO is complete
+     * @param srcs buffers
+     * @param <A> The attachment type
+     * @return the completion state (done, done inline, or still pending)
+     */
+    public final <A> CompletionState write(long timeout, TimeUnit unit, A attachment,
+            CompletionHandler<Long, ? super A> handler, ByteBuffer... srcs) {
+        if (srcs == null) {
+            throw new IllegalArgumentException();
+        }
+        return write(srcs, 0, srcs.length, BlockingMode.CLASSIC, timeout, unit, attachment, null, handler);
     }
 
     /**
@@ -1100,12 +1397,107 @@ public abstract class SocketWrapperBase<E> {
      * @param <A> The attachment type
      * @return the completion state (done, done inline, or still pending)
      */
-    public <A> CompletionState write(ByteBuffer[] srcs, int offset, int length,
+    public final <A> CompletionState write(ByteBuffer[] srcs, int offset, int length,
             BlockingMode block, long timeout, TimeUnit unit, A attachment,
             CompletionCheck check, CompletionHandler<Long, ? super A> handler) {
-        throw new UnsupportedOperationException();
+        return vectoredOperation(false, srcs, offset, length, block, timeout, unit, attachment, check, handler);
     }
 
+
+    /**
+     * Vectored operation. The completion handler will be called once
+     * the operation is complete or an error occurred. If a CompletionCheck
+     * object has been provided, the completion handler will only be
+     * called if the callHandler method returned true. If no
+     * CompletionCheck object has been provided, the default NIO2
+     * behavior is used: the completion handler will be called, even
+     * if the operation is incomplete, or if the operation completed inline.
+     *
+     * @param read true if the operation is a read, false if it is a write
+     * @param buffers buffers
+     * @param offset in the buffer array
+     * @param length in the buffer array
+     * @param block is the blocking mode that will be used for this operation
+     * @param timeout timeout duration for the write
+     * @param unit units for the timeout duration
+     * @param attachment an object to attach to the I/O operation that will be
+     *        used when calling the completion handler
+     * @param check for the IO operation completion
+     * @param handler to call when the IO is complete
+     * @param <A> The attachment type
+     * @return the completion state (done, done inline, or still pending)
+     */
+    protected final <A> CompletionState vectoredOperation(boolean read,
+            ByteBuffer[] buffers, int offset, int length,
+            BlockingMode block, long timeout, TimeUnit unit, A attachment,
+            CompletionCheck check, CompletionHandler<Long, ? super A> handler) {
+        IOException ioe = getError();
+        if (ioe != null) {
+            handler.failed(ioe, attachment);
+            return CompletionState.ERROR;
+        }
+        if (timeout == -1) {
+            timeout = AbstractEndpoint.toTimeout(read ? getReadTimeout() : getWriteTimeout());
+            unit = TimeUnit.MILLISECONDS;
+        } else if (!hasPerOperationTimeout() && (unit.toMillis(timeout) != (read ? getReadTimeout() : getWriteTimeout()))) {
+            if (read) {
+                setReadTimeout(unit.toMillis(timeout));
+            } else {
+                setWriteTimeout(unit.toMillis(timeout));
+            }
+        }
+        if (block == BlockingMode.BLOCK || block == BlockingMode.SEMI_BLOCK) {
+            try {
+                if (read ? !readPending.tryAcquire(timeout, unit) : !writePending.tryAcquire(timeout, unit)) {
+                    handler.failed(new SocketTimeoutException(), attachment);
+                    return CompletionState.ERROR;
+                }
+            } catch (InterruptedException e) {
+                handler.failed(e, attachment);
+                return CompletionState.ERROR;
+            }
+        } else {
+            if (read ? !readPending.tryAcquire() : !writePending.tryAcquire()) {
+                if (block == BlockingMode.NON_BLOCK) {
+                    return CompletionState.NOT_DONE;
+                } else {
+                    handler.failed(read ? new ReadPendingException() : new WritePendingException(), attachment);
+                    return CompletionState.ERROR;
+                }
+            }
+        }
+        VectoredIOCompletionHandler<A> completion = new VectoredIOCompletionHandler<>();
+        OperationState<A> state = newOperationState(read, buffers, offset, length, block, timeout, unit,
+                attachment, check, handler, read ? readPending : writePending, completion);
+        if (read) {
+            readOperation = state;
+        } else {
+            writeOperation = state;
+        }
+        state.start();
+        if (block == BlockingMode.BLOCK) {
+            synchronized (state) {
+                if (state.state == CompletionState.PENDING) {
+                    try {
+                        state.wait(unit.toMillis(timeout));
+                        if (state.state == CompletionState.PENDING) {
+                            return CompletionState.ERROR;
+                        }
+                    } catch (InterruptedException e) {
+                        completion.failed(new SocketTimeoutException(), state);
+                        return CompletionState.ERROR;
+                    }
+                }
+            }
+        }
+        return state.state;
+    }
+
+    protected abstract <A> OperationState<A> newOperationState(boolean read,
+            ByteBuffer[] buffers, int offset, int length,
+            BlockingMode block, long timeout, TimeUnit unit, A attachment,
+            CompletionCheck check, CompletionHandler<Long, ? super A> handler,
+            Semaphore semaphore, VectoredIOCompletionHandler<A> completion);
 
     // --------------------------------------------------------- Utility methods
 

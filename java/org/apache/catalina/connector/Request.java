@@ -1212,13 +1212,31 @@ public class Request implements HttpServletRequest {
                 (sm.getString("coyoteRequest.getReader.ise"));
         }
 
+        // InputBuffer has no easily accessible reference chain to the Context
+        // to check for a default request character encoding at the Context.
+        // Therefore, if a Context default should be used, it is set explicitly
+        // here. Need to do this before setting usingReader.
+        if (coyoteRequest.getCharacterEncoding() == null) {
+            // Nothing currently set explicitly.
+            // Check the content
+            Context context = getContext();
+            if (context != null) {
+                String enc = context.getRequestCharacterEncoding();
+                if (enc != null) {
+                    // Explicitly set the context default so it is visible to
+                    // InputBuffer when creating the Reader.
+                    setCharacterEncoding(enc);
+                }
+            }
+        }
+
         usingReader = true;
+
         inputBuffer.checkConverter();
         if (reader == null) {
             reader = new CoyoteReader(inputBuffer);
         }
         return reader;
-
     }
 
 
@@ -2974,11 +2992,9 @@ public class Request implements HttpServletRequest {
         if (!create) {
             return null;
         }
-        if (response != null
-                && context.getServletContext()
-                        .getEffectiveSessionTrackingModes()
-                        .contains(SessionTrackingMode.COOKIE)
-                && response.getResponse().isCommitted()) {
+        boolean trackModesIncludesCookie =
+                context.getServletContext().getEffectiveSessionTrackingModes().contains(SessionTrackingMode.COOKIE);
+        if (trackModesIncludesCookie && response.getResponse().isCommitted()) {
             throw new IllegalStateException(
                     sm.getString("coyoteRequest.sessionCreateCommitted"));
         }
@@ -3027,13 +3043,9 @@ public class Request implements HttpServletRequest {
         session = manager.createSession(sessionId);
 
         // Creating a new session cookie based on that session
-        if (session != null
-                && context.getServletContext()
-                        .getEffectiveSessionTrackingModes()
-                        .contains(SessionTrackingMode.COOKIE)) {
-            Cookie cookie =
-                ApplicationSessionCookieConfig.createSessionCookie(
-                        context, session.getIdInternal(), isSecure());
+        if (session != null && trackModesIncludesCookie) {
+            Cookie cookie = ApplicationSessionCookieConfig.createSessionCookie(
+                    context, session.getIdInternal(), isSecure());
 
             response.addSessionCookieInternal(cookie);
         }

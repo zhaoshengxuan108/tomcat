@@ -258,8 +258,10 @@
     <include name="**/*.dtd"/>
     <include name="**/*.htm"/>
     <include name="**/*.html"/>
+    <include name="**/*.iml"/>
     <include name="**/*.ini"/>
     <include name="**/*.java"/>
+    <include name="**/*.jj"/>
     <include name="**/*.jjt"/>
     <include name="**/*.json"/>
     <include name="**/*.jsp"/>
@@ -291,6 +293,8 @@
     <include name="**/*.xml"/>
     <include name="**/*.xsd"/>
     <include name="**/*.xsl"/>
+    <include name="**/*.yaml"/>
+    <include name="**/Dockerfile"/>
     <!-- Exclude files that use 16-bit encodings. -->
     <!-- This prevents fixcrlf corrupting them during a release -->
     <exclude name="**/bom-none-prolog-utf16?e.jspx"/>
@@ -569,6 +573,7 @@
         <exclude name="**/*_2.xml"/>
         <exclude name="res/checkstyle/header-al2.txt"/>
         <!-- Exclude auto-generated files -->
+        <exclude name="java/org/apache/el/parser/ELParser.jj" />
         <exclude name="java/org/apache/el/parser/ELParser*.java" />
         <exclude name="java/org/apache/el/parser/Node.java" />
         <exclude name="java/org/apache/**/parser/JJT*ParserState.java" />
@@ -620,7 +625,6 @@
            source="${compile.source}"
            target="${compile.target}"
            release="${compile.release}"
-           excludes="**/.svn/**"
            encoding="ISO-8859-1"
            includeAntRuntime="true" >
       <!-- Uncomment this to show unchecked warnings:
@@ -633,7 +637,7 @@
              classname="org.apache.tomcat.buildutil.CheckEol"
              classpath="${tomcat.classes}" />
 
-    <checkeol>
+    <checkeol mode="LF">
       <fileset dir="." >
         <patternset refid="text.files" />
         <include name="**/*.bat"/>
@@ -676,7 +680,6 @@
            source="${compile.source}"
            target="${compile.target}"
            release="${compile.release}"
-           excludes="**/.svn/**"
            encoding="ISO-8859-1"
            includeAntRuntime="true" >
       <!-- Uncomment this to show unchecked warnings:
@@ -1198,7 +1201,6 @@
              target="${compile.target}"
              release="${compile.release}"
              classpath="${tomcat.classes}"
-             excludes="**/CVS/**,**/.svn/**"
              encoding="ISO-8859-1"
              includeantruntime="false">
     </javac>
@@ -1211,10 +1213,18 @@
              target="${compile.target}"
              release="${compile.release}"
              classpath="${tomcat.classes}"
-             excludes="**/CVS/**,**/.svn/**"
              encoding="ISO-8859-1"
              includeantruntime="false">
     </javac>
+
+    <!-- Convert the message files of the examples webapp from UTF-8 to ASCII.
+    This can be removed after upgrading to Java 9+ as the minimum JRE and
+    specifying the encoding when loading the ResourceBundles -->
+    <native2ascii src="webapps/examples/WEB-INF/classes"
+                  dest="${tomcat.build}/webapps/examples/WEB-INF/classes"
+                  includes="**/LocalStrings*.properties"
+                  encoding="UTF-8"/>
+
   </target>
 
   <target name="build-tomcat-jdbc" depends="package">
@@ -2075,13 +2085,13 @@ Apache Tomcat ${version} native binaries for Win64 AMD64/EMT64 platform.
             </and>
             <filename name="**/*.asc" />
             <filename name="**/*.tmp" />
-            <filename name="**/*.jj" />
             <filename name="**/maven-ant-tasks-*.jar" />
             <filename name="**/thumbs.db" />
             <filename name="**/Thumbs.db" />
             <filename name="*.launch"/>
             <filename name="bin/setenv.*" />
             <filename name="java/org/apache/catalina/startup/catalina.properties" />
+            <filename name="java/org/apache/el/parser/ELParser.jj" />
             <filename name="logs/**" />
             <filename name="webapps/docs/jdbc-pool.xml" />
             <filename name="work/**" />

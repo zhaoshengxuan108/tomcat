@@ -418,12 +418,12 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
             registeredJmxObjectName = null;
         }
         closed = true;
-        final GenericObjectPool<?> oldpool = connectionPool;
+        final GenericObjectPool<?> oldPool = connectionPool;
         connectionPool = null;
         dataSource = null;
         try {
-            if (oldpool != null) {
-                oldpool.close();
+            if (oldPool != null) {
+                oldPool.close();
             }
         } catch (final RuntimeException e) {
             throw e;
@@ -747,6 +747,21 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
             return abandonedConfig.getLogWriter();
         }
         return null;
+    }
+
+    /**
+     * If the connection pool implements {@link org.apache.tomcat.dbcp.pool2.UsageTracking UsageTracking}, should the
+     * connection pool record a stack trace every time a method is called on a pooled connection and retain the most
+     * recent stack trace to aid debugging of abandoned connections?
+     *
+     * @return <code>true</code> if usage tracking is enabled
+     */
+    @Override
+    public boolean getAbandonedUsageTracking() {
+        if (abandonedConfig != null) {
+            return abandonedConfig.getUseUsageTracking();
+        }
+        return false;
     }
 
     /**
@@ -1506,7 +1521,8 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
     /**
      * Manually evicts idle connections.
      *
-     * @throws Exception when there is a problem evicting idle objects.
+     * @throws Exception Thrown by {@link GenericObjectPool#evict()}.
+     * @see GenericObjectPool#evict()
      */
     public void evict() throws Exception {
         if (connectionPool != null) {
@@ -1629,21 +1645,6 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
         if (gop != null) {
             gop.setAbandonedConfig(abandonedConfig);
         }
-    }
-
-    /**
-     * If the connection pool implements {@link org.apache.tomcat.dbcp.pool2.UsageTracking UsageTracking}, should the
-     * connection pool record a stack trace every time a method is called on a pooled connection and retain the most
-     * recent stack trace to aid debugging of abandoned connections?
-     *
-     * @return <code>true</code> if usage tracking is enabled
-     */
-    @Override
-    public boolean getAbandonedUsageTracking() {
-        if (abandonedConfig != null) {
-            return abandonedConfig.getUseUsageTracking();
-        }
-        return false;
     }
 
     /**

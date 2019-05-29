@@ -72,6 +72,8 @@ class Stream extends AbstractStream implements HeaderEmitter {
 
     private final Http2UpgradeHandler handler;
     private final StreamStateMachine state;
+    private final Object connectionAllocationLock = new Object();
+
     // State machine would be too much overhead
     private int headerState = HEADER_STATE_START;
     private StreamException headerException = null;
@@ -229,9 +231,18 @@ class Stream extends AbstractStream implements HeaderEmitter {
         if (inputBuffer != null) {
             inputBuffer.receiveReset();
         }
-        // Writes wait on Stream so we can notify directly
+        cancelAllocationRequests();
+    }
+
+
+    final void cancelAllocationRequests() {
+        // Cancel wait on stream allocation request (if any)
         synchronized (this) {
-            this.notifyAll();
+            this.notify();
+        }
+        // Cancel wait on connection allocation request (if any)
+        synchronized (connectionAllocationLock) {
+            connectionAllocationLock.notify();
         }
     }
 
@@ -252,7 +263,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
         if (notify && getWindowSize() > 0) {
             if (coyoteResponse.getWriteListener() == null) {
                 // Blocking, so use notify to release StreamOutputBuffer
-                notifyAll();
+                notify();
             } else {
                 // Non-blocking so dispatch
                 coyoteResponse.action(ActionCode.DISPATCH_WRITE, null);
@@ -273,8 +284,8 @@ class Stream extends AbstractStream implements HeaderEmitter {
                 throw new CloseNowException(sm.getString("stream.notWritable",
                         getConnectionId(), getIdentifier()));
             }
-            try {
-                if (block) {
+            if (block) {
+                try {
                     long writeTimeout = handler.getProtocol().getStreamWriteTimeout();
                     if (writeTimeout < 0) {
                         wait();
@@ -283,26 +294,16 @@ class Stream extends AbstractStream implements HeaderEmitter {
                     }
                     windowSize = getWindowSize();
                     if (windowSize == 0) {
-                        String msg = sm.getString("stream.writeTimeout");
-                        StreamException se = new StreamException(
-                                msg, Http2Error.ENHANCE_YOUR_CALM, getIdAsInt());
-                        // Prevent the application making further writes
-                        streamOutputBuffer.closed = true;
-                        // Prevent Tomcat's error handling trying to write
-                        coyoteResponse.setError();
-                        coyoteResponse.setErrorReported();
-                        // Trigger a reset once control returns to Tomcat
-                        streamOutputBuffer.reset = se;
-                        throw new CloseNowException(msg, se);
+                        doWriteTimeout();
                     }
-                } else {
-                    return 0;
+                } catch (InterruptedException e) {
+                    // Possible shutdown / rst or similar. Use an IOException to
+                    // signal to the client that further I/O isn't possible for this
+                    // Stream.
+                    throw new IOException(e);
                 }
-            } catch (InterruptedException e) {
-                // Possible shutdown / rst or similar. Use an IOException to
-                // signal to the client that further I/O isn't possible for this
-                // Stream.
-                throw new IOException(e);
+            } else {
+                return 0;
             }
         }
         int allocation;
@@ -313,6 +314,21 @@ class Stream extends AbstractStream implements HeaderEmitter {
         }
         decrementWindowSize(allocation);
         return allocation;
+    }
+
+
+    void doWriteTimeout() throws CloseNowException {
+        String msg = sm.getString("stream.writeTimeout");
+        StreamException se = new StreamException(
+                msg, Http2Error.ENHANCE_YOUR_CALM, getIdAsInt());
+        // Prevent the application making further writes
+        streamOutputBuffer.closed = true;
+        // Prevent Tomcat's error handling trying to write
+        coyoteResponse.setError();
+        coyoteResponse.setErrorReported();
+        // Trigger a reset once control returns to Tomcat
+        streamOutputBuffer.reset = se;
+        throw new CloseNowException(msg, se);
     }
 
 
@@ -347,6 +363,11 @@ class Stream extends AbstractStream implements HeaderEmitter {
             return;
         }
 
+        if (name.length() == 0) {
+            throw new HpackException(sm.getString("stream.header.empty",
+                    getConnectionId(), getIdentifier()));
+        }
+
         boolean pseudoHeader = name.charAt(0) == ':';
 
         if (pseudoHeader && headerState != HEADER_STATE_PSEUDO) {
@@ -361,7 +382,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
             headerState = HEADER_STATE_REGULAR;
         }
 
-        switch(name) {
+        switch (name) {
         case ":method": {
             if (coyoteRequest.method().isNull()) {
                 coyoteRequest.method().setString(value);
@@ -607,16 +628,25 @@ class Stream extends AbstractStream implements HeaderEmitter {
 
 
     final void receivedEndOfStream() throws ConnectionException {
-        long contentLengthHeader = coyoteRequest.getContentLengthLong();
-        if (contentLengthHeader > -1 && contentLengthReceived != contentLengthHeader) {
+        if (isContentLengthInconsistent()) {
             throw new ConnectionException(sm.getString("stream.header.contentLength",
-                    getConnectionId(), getIdentifier(), Long.valueOf(contentLengthHeader),
+                    getConnectionId(), getIdentifier(),
+                    Long.valueOf(coyoteRequest.getContentLengthLong()),
                     Long.valueOf(contentLengthReceived)), Http2Error.PROTOCOL_ERROR);
         }
         state.receivedEndOfStream();
         if (inputBuffer != null) {
             inputBuffer.notifyEof();
         }
+    }
+
+
+    final boolean isContentLengthInconsistent() {
+        long contentLengthHeader = coyoteRequest.getContentLengthLong();
+        if (contentLengthHeader > -1 && contentLengthReceived != contentLengthHeader) {
+            return true;
+        }
+        return false;
     }
 
 
@@ -676,7 +706,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
     }
 
 
-    private final boolean isInputFinished() {
+    final boolean isInputFinished() {
         return !state.isFrameTypePermitted(FrameType.DATA);
     }
 
@@ -750,6 +780,11 @@ class Stream extends AbstractStream implements HeaderEmitter {
 
     StreamException getResetException() {
         return streamOutputBuffer.reset;
+    }
+
+
+    Object getConnectionAllocationLock() {
+        return connectionAllocationLock;
     }
 
 

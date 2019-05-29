@@ -399,6 +399,10 @@
       handling can be configured within each web application. Alternatively, you
       can explicitly configure an <a href="config/valve.html">ErrorReportValve</a>
       and set its <strong>showReport</strong> attribute to <code>false</code>.</p>
+
+      <p>The RewriteValve uses regular expressions and poorly formed regex
+      patterns may be vulnerable to "catastrophic backtracking" or "ReDoS". See
+      <a href="rewrite.html">Rewrite docs</a> for more details.</p>
     </subsection>
 
     <subsection name="Realms">
@@ -502,6 +506,14 @@
     <p>The CGI Servlet is disabled by default. If enabled, the debug
     initialisation parameter should not be set to <code>10</code> or higher on a
     production system because the debug page is not secure.</p>
+
+    <p>When using the CGI Servlet on Windows with
+    <code>enableCmdLineArguments</code> enabled, review the setting of
+    <code>cmdLineArgumentsDecoded</code> carefully and ensure that it is
+    appropriate for your environment. The default value is secure. Insecure
+    configurations may expose the server to remote code execution. Further
+    information on the potential risks and mitigations may be found by
+    following the links in the <a href="cgi-howto.html">CGI How To</a>.</p>
 
     <p><a href="config/filter.html">FailedRequestFilter</a>
     can be configured and used to reject requests that had errors during
